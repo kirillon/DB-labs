@@ -1,0 +1,9 @@
+Faker>=30,<41
+psycopg[binary]>=3.2,<4
+python-dotenv>=1,<2
+pandas>=2.2,<3
+airportsdata>=20241001
+geopy>=2.4,<3
+openap>=2,<3
+pycountry
+
