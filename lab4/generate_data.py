@@ -232,10 +232,18 @@ class Data:
     'пятница', 'суббота', 'воскресенье'
 ]
         flight_info, available = {}, {}
+        # При наличии пары бортов одного типа последний остаётся резервным.
+        by_type = defaultdict(list)
+        for plane in self.rows['airplane']:
+            by_type[plane['type_id']].append(plane['id'])
+        reserves = {ids[-1] for ids in by_type.values() if len(ids) >= 2}
+
         canceled_days = {(plane, day) for plane in range(1, planes + 1) for day in range(days)
                          if datetime.combine(start + timedelta(days=day), time(20)) < now
                          and (self.rng.random() < .04 or (plane == 1 and day == 0))}
         for airplane in range(1, planes + 1):
+            if airplane in reserves:
+                continue
             typ = (airplane - 1) % types_count + 1
             route = r.choice(routes[routes.type_id == typ].to_dict('records'))
             destination, minutes, base_price = route['destination'], route['minutes'], route['price']
@@ -304,10 +312,12 @@ class Data:
                     planned_arr = arr + timedelta(days=day)
                 
                     canceled = (airplane, day) in canceled_days
-                    delay = (
-                          0 if r.random() < 0.75
-                            else r.randrange(5, 121, 5)
-                    )
+                    # Сочетаем ранние вылеты, пунктуальность и серьёзные задержки.
+                    delay = r.choices(
+                        [r.randint(-10, -1), 0, r.randint(5, 15),
+                         r.randint(16, 60), r.randint(61, 180)],
+                        weights=[10, 40, 20, 23, 7],
+                    )[0]
                     actual_dep = planned_dep + timedelta(minutes=delay)
                     actual_arr = planned_arr + timedelta(minutes=delay)
                     if canceled:
@@ -368,7 +378,11 @@ class Data:
             fid = f['id']
             typ, price, flight_canceled = flight_info[fid]
             already = len(seats[typ]) - len(available[fid])
-            target = max(0, int(len(seats[typ]) * r.uniform(.55, .88)) - already)
+            # Направления с устойчивым спросом чередуются с отдельными провалами
+            # и пиками: это даёт заметные изменения в оконных отчётах.
+            demand = r.choices([r.uniform(.15, .40), r.uniform(.60, .80),
+                                r.uniform(.90, 1.0)], weights=[15, 35, 50])[0]
+            target = max(0, int(len(seats[typ]) * demand) - already)
             pool = [person for person in self.rows['passenger'] if can_travel(person, [f])]
             return_pools = {}
             while target > 0:
@@ -427,26 +441,79 @@ class Data:
                                           currency=self.value('ticket', 'currency', 'рубль', 'RUB'),
                                           max_baggage_weight=0 if fare == 'базовый' else 32 if fare == 'все включено' else 23,
                                           status=self.value('ticket', 'status', 'отменен' if canceled else 'действителен'))
-                        if not canceled and segment['actual_departure'] and r.random() < .6:
-                            self.baggage(ticket, segment, now)
+                        if not canceled and segment['actual_departure'] and r.random() < .7:
+                            for _ in range(r.choices([1, 2, 3], [80, 18, 2])[0]):
+                                self.baggage(ticket, segment, now)
                 target -= len(group)
 
-        for f in self.rows['flight']:
-            if f['status'] != 'отменен' or f['departure_airport_id'] != 1:
+        # Замены выполняются после продажи билетов: резерв того же типа
+        # сохраняет схему мест, маршрут и допуски назначенного экипажа.
+        reserve_until = {}
+        for f in sorted(self.rows['flight'], key=lambda row: row['planned_departure']):
+            if f['status'] == 'отменен' or f['planned_departure'] > now:
                 continue
-            incident = self.add('incident', airplane_id=f['airplane_id'], flight_id=f['id'],
-                                event_date=f['planned_departure'] - timedelta(minutes=50),
-                                type=self.value('incident', 'type', 'техническая неисправность', 'отмена рейса'),
-                                description='При предполетном осмотре обнаружена неисправность датчика. '
-                                            'Рейс отменен; после замены и проверки борт допущен к эксплуатации.',
-                                severity=r.randint(2, 5), responsible='Инженер ' + self.fake.name(),
-                                status=self.value('incident', 'status', 'закрыт'), cost=r.randint(200, 900) * 1000)
-            self.add('technicalwork', airplane_id=f['airplane_id'], incident_id=incident,
-                     work_type=self.value('technicalwork', 'work_type', 'замена детали', 'ремонт'),
-                     planned_start=f['flight_date'], planned_end=f['flight_date'],
-                     actual_start=f['flight_date'], actual_end=f['flight_date'],
+            original = f['airplane_id']
+            typ = self.rows['airplane'][original - 1]['type_id']
+            reserve = by_type[typ][-1]
+            # Заменяем весь оборот из хаба и обратно, сохраняя положение борта.
+            if f['departure_airport_id'] != 1 or reserve not in reserves:
+                continue
+            returning = next((other for other in self.rows['flight']
+                              if other['airplane_id'] == original
+                              and other['departure_airport_id'] == f['arrival_airport_id']
+                              and other['arrival_airport_id'] == 1
+                              and other['planned_departure'] >= f['planned_arrival']
+                              and other['planned_departure'] < f['planned_arrival'] + timedelta(hours=4)
+                              and other['status'] != 'отменен'), None)
+            if returning is None or r.random() >= .25:
+                continue
+            begin = f['actual_departure'] or f['planned_departure']
+            if reserve_until.get(reserve, datetime.min) > begin:
+                continue
+            for segment in (f, returning):
+                segment['previous_airplane_id'] = original
+                segment['airplane_id'] = reserve
+            reserve_until[reserve] = max(returning['planned_arrival'],
+                                         returning['actual_arrival'] or returning['planned_arrival']) + timedelta(hours=2)
+
+        # У разных бортов разная частота инцидентов. Работы после прилёта
+        # ограничены следующим вылетом; отменённые рейсы также дают инциденты.
+        for f in self.rows['flight']:
+            if f['planned_departure'] > now:
+                continue
+            canceled = f['status'] == 'отменен'
+            if not canceled and (f['actual_arrival'] is None or
+                                 r.random() >= (.08 if f['airplane_id'] % 2 else .25)):
+                continue
+            plane = f['airplane_id']
+            moment = (f['planned_departure'] - timedelta(minutes=50) if canceled
+                      else f['actual_arrival'])
+            incident = self.add('incident', airplane_id=plane, flight_id=f['id'],
+                                event_date=moment,
+                                type=self.value('incident', 'type', r.choice([
+                                    'техническая неисправность', 'повреждение самолета'])),
+                                description='При осмотре обнаружена неисправность; назначены диагностика и обслуживание.',
+                                severity=r.choices([1, 2, 3, 5, 7], [25, 30, 25, 15, 5])[0],
+                                responsible='Инженер ' + self.fake.name(),
+                                status=self.value('incident', 'status', 'закрыт'),
+                                cost=r.randint(5, 1500) * 1000)
+            next_departure = min((other['actual_departure'] or other['planned_departure']
+                                  for other in self.rows['flight']
+                                  if other['airplane_id'] == plane
+                                  and other['status'] != 'отменен'
+                                  and (other['actual_departure'] or other['planned_departure']) > moment),
+                                 default=now)
+            last_day = min(next_departure.date(), now.date())
+            end = min(moment.date() + timedelta(days=r.randint(0, 4)), last_day)
+            self.add('technicalwork', airplane_id=plane, incident_id=incident,
+                     work_type=self.value('technicalwork', 'work_type',
+                                          ['ремонт', 'осмотр', 'техническое обслуживание', 'замена детали'][
+                                              len(self.rows['technicalwork']) % 4]),
+                     planned_start=moment.date(), planned_end=end,
+                     actual_start=moment.date(), actual_end=end,
                      executor='Техник ' + self.fake.name(),
-                     status=self.value('technicalwork', 'status', 'завершена'))
+                     status=self.value('technicalwork', 'status',
+                                       r.choices(['завершена', 'отменена'], [90, 10])[0]))
 
     def baggage(self, ticket, f, now):
         r = self.rng
@@ -458,7 +525,18 @@ class Data:
         steps = [('приём', f['planned_departure'] - timedelta(hours=2), 'зарегистрирован'),
                  ('погрузка', f['actual_departure'] - timedelta(minutes=35), 'загружен')]
         if arrived:
-            steps.append(('прибытие', f['actual_arrival'] + timedelta(minutes=15), 'готов к выдаче'))
+            scenario = r.choices(['норма', 'нет событий', 'нет прибытия',
+                                  'нет выдачи', 'ранняя выдача'], [72, 5, 7, 10, 6])[0]
+            if scenario == 'нет событий':
+                steps = []
+            else:
+                if scenario != 'нет прибытия':
+                    steps.append(('прибытие', f['actual_arrival'] + timedelta(minutes=15), 'готов к выдаче'))
+                if scenario != 'нет выдачи':
+                    delivery = f['actual_arrival'] + timedelta(
+                        minutes=-r.randint(5, 30) if scenario == 'ранняя выдача' else r.randint(25, 90))
+                    steps.append(('выдача', delivery, 'готов к выдаче'))
+            steps.sort(key=lambda step: step[1])
         previous = None if self.columns['baggageevent']['previous_state'][0] else 'зарегистрирован'
         for number, (event, moment, new) in enumerate(steps, 1):
             if moment > now:
@@ -467,7 +545,7 @@ class Data:
                      event_type=self.value('baggageevent', 'event_type', event), event_time=moment,
                      previous_state=previous, new_state=self.value('baggageevent', 'new_state', new))
             previous = new
-        self.rows['baggage'][-1]['status'] = previous
+        self.rows['baggage'][-1]['status'] = previous or self.value('baggage', 'status', 'зарегистрирован')
 
 
 def insert_data(conn, schema, data):
@@ -510,6 +588,8 @@ def main():
     parser.add_argument('--seed', type=int, default=69)
     parser.add_argument('--start-date', type=date.fromisoformat, help='YYYY-MM-DD; по умолчанию 14 дней назад')
     args = parser.parse_args()
+    if args.days < 1 or args.planes < 1:
+        parser.error('--days и --planes должны быть положительными')
     load_dotenv(args.env)
     missing = [key for key in ('POSTGRES_DB', 'POSTGRES_USER', 'POSTGRES_PASSWORD') if not os.getenv(key)]
     if missing:
